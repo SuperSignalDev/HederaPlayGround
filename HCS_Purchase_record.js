@@ -10,6 +10,26 @@ const {
     TopicId // Topic ID 처리를 위해 추가
   } = require("@hashgraph/sdk"); // v2.64.5
 
+// Hedera DID SDK 모듈(선택적)
+// 설치되어 있지 않거나 ESM/CommonJS 불일치로 생성자를 찾을 수 없는 경우에도
+// 스크립트가 계속 동작하도록 방어적으로 처리합니다.
+let DidMethod = null;
+let didAvailable = false;
+try {
+    const DID_SDK_MODULE = require("@hashgraph/did-sdk-js");
+    DidMethod = DID_SDK_MODULE.DidMethod 
+        || (DID_SDK_MODULE.default && DID_SDK_MODULE.default.DidMethod)
+        || (typeof DID_SDK_MODULE.default === 'function' ? DID_SDK_MODULE.default : null);
+
+    if (typeof DidMethod === 'function') {
+        didAvailable = true;
+    } else {
+        console.warn("⚠️ @hashgraph/did-sdk-js loaded but DidMethod constructor not found. Continuing without DID SDK.");
+    }
+} catch (err) {
+    console.warn("⚠️ @hashgraph/did-sdk-js is not installed or could not be required. Continuing without DID SDK. (Install with 'npm install @hashgraph/did-sdk-js' to enable DID features)");
+}
+
 // Load environment variables from .env file
 require('dotenv').config();
 
@@ -22,10 +42,31 @@ function createClient(operatorIdStr, operatorKeyStr) {
     throw new Error("Operator ID 또는 Key가 .env 파일에 누락되었습니다.");
   }
 
-  const client = Client.forTestnet();
-  // Operator 계정 설정
-  client.setOperator(operatorIdStr, operatorKeyStr);
-  return client;
+    const client = Client.forTestnet();
+
+    // operatorIdStr/operatorKeyStr can be either strings or already-parsed SDK objects
+    let operatorId = operatorIdStr;
+    let operatorKey = operatorKeyStr;
+
+    try {
+        if (typeof operatorIdStr === 'string') {
+            operatorId = AccountId.fromString(operatorIdStr);
+        }
+    } catch (e) {
+        throw new Error("Invalid OPERATOR_ID format. Expected account id like '0.0.1234'.");
+    }
+
+    try {
+        if (typeof operatorKeyStr === 'string') {
+            // Try generic fromString which handles multiple encodings
+            operatorKey = PrivateKey.fromString(operatorKeyStr);
+        }
+    } catch (e) {
+        throw new Error("Invalid OPERATOR_KEY format. Use a valid private key string.");
+    }
+
+    client.setOperator(operatorId, operatorKey);
+    return client;
 }
 
 // ---------------------------
@@ -45,14 +86,45 @@ async function createNewAccount(client) {
   // 영수증 및 계정 ID 획득
   const receipt = await txResponse.getReceipt(client);
   const newAccountId = receipt.accountId;
+  
+  // 🚨 [수정] DID SDK를 사용하여 DID 인스턴스 생성
+  // 상단에서 이미 DidMethod 생성자를 올바르게 가져왔으므로, 바로 사용합니다.
+  
+  // 이전에 삽입했던 복잡한 require/생성자 검색 로직 제거
+  // const DID_SDK = require("@hashgraph/did-sdk-js");
+  // const DidMethodClass = DID_SDK.DidMethod;
+  // If DID SDK is available, use it. Otherwise, fallback to a simple DID using account id.
+  let newDid;
+  if (didAvailable && typeof DidMethod === 'function') {
+      try {
+          const didMethod = new DidMethod(newAccountId, newAccountPrivateKey);
+          newDid = didMethod.getDid(); // DID 문자열 획득
+
+          // Attempt to register DID Document on HCS; on failure log and continue
+          try {
+              const registerReceipt = await didMethod.register(client);
+              console.log("✅ DID Document Registered on HCS:", registerReceipt.toString());
+          } catch (e) {
+              console.warn("⚠️ DID registration failed (continuing):", e.message);
+          }
+      } catch (e) {
+          console.warn("⚠️ Failed to create DidMethod instance (falling back to account-based DID):", e.message);
+          newDid = `did:hedera:${newAccountId.toString()}`;
+      }
+  } else {
+      // Fallback DID when DID SDK is not available
+      newDid = `did:hedera:${newAccountId.toString()}`;
+  }
+
 
   console.log("----------------------- Account Creation -----------------------");
   console.log("🗝️ New Account Private Key:", newAccountPrivateKey.toStringDer());
-  console.log("🔑 New Account Public Key:", newAccountPublicKey.toStringDer());
   console.log("🆔 New Account ID:", newAccountId.toString());
+  console.log("🌐 New Hedera DID:", newDid);
   console.log("----------------------------------------------------------------");
 
-  return { newAccountId, newAccountPrivateKey };
+  // 🚨 DID를 포함하여 반환
+  return { newAccountId, newAccountPrivateKey, newDid };
 }
 
 // ---------------------------
@@ -89,7 +161,7 @@ async function verifyTopicCreated(client, topicId) {
 }
 
 // ---------------------------
-// 5️⃣ 구매 내역을 새 계정으로 서명하고, Operator가 gas 대납
+// 5️⃣ 구매 내역을 새 계정으로 서명하고, Operator가 gas 대납 (DID 사용)
 // ---------------------------
 async function recordPurchaseWithNewAccount(client, topicId, purchaseData, newAccountPrivateKey) {
   const message = JSON.stringify(purchaseData);
@@ -104,16 +176,18 @@ async function recordPurchaseWithNewAccount(client, topicId, purchaseData, newAc
   const submitTx = await tx.execute(client); 
   const receipt = await submitTx.getReceipt(client);
 
-  console.log(`   [Submit] User ${purchaseData.user_id.split('.')[2]} - ${purchaseData.sequence}: ${receipt.status.toString()}`);
+  // 🚨 로그에 DID의 마지막 부분을 사용하여 출력
+  const didShort = purchaseData.did_id.split(':').pop(); 
+  console.log(`   [Submit] DID ${didShort} - ${purchaseData.sequence}: ${receipt.status.toString()}`);
 }
 
 // ---------------------------
-// 6️⃣ 미러 노드에서 특정 계정의 구매 기록을 '모두' 조회 및 필터링 (페이지네이션 적용 및 이름 변경)
+// 6️⃣ 미러 노드에서 특정 계정의 구매 기록을 '모두' 조회 및 필터링 (DID 사용)
 // ---------------------------
-async function fetchAllRecordsByAccountId(topicId, accountId) {
+async function fetchAllRecordsByDid(topicId, did) {
     let foundRecords = [];
     let processedMessagesCount = 0; // 토픽에서 처리된 전체 메시지 수를 기록
-    const targetAccountIdStr = accountId.toString();
+    const targetDidStr = did; // 🚨 타겟은 DID 문자열
     // 초기 URL: 최대 100개씩, 오름차순으로 가져옴. 미러 노드 주소 확인 및 사용.
     let nextUrl = `https://testnet.mirrornode.hedera.com/api/v1/topics/${topicId.toString()}/messages?limit=100&order=asc`;
 
@@ -142,8 +216,8 @@ async function fetchAllRecordsByAccountId(topicId, accountId) {
                 try {
                     const record = JSON.parse(decodedContent);
                     
-                    // 메시지 내부의 'user_id' 필드를 우리가 생성한 계정 ID와 비교
-                    if (record.user_id === targetAccountIdStr) {
+                    // 🚨 메시지 내부의 'did_id' 필드를 우리가 생성한 DID와 비교
+                    if (record.did_id === targetDidStr) {
                         foundRecords.push({
                             consensusTimestamp: message.consensus_timestamp,
                             sequenceNumber: message.sequence_number,
@@ -185,6 +259,7 @@ async function simulatePurchaseRecords(client, topicId, numUsers, numSubmissions
     const users = [];
     console.log("\n===================== 1. Creating Users =====================");
     for (let i = 0; i < numUsers; i++) {
+        // 🚨 newDid를 포함하여 유저 정보 저장
         const user = await createNewAccount(client);
         users.push(user);
     }
@@ -192,16 +267,16 @@ async function simulatePurchaseRecords(client, topicId, numUsers, numSubmissions
     // 2. 기록 전송 (Submission)
     console.log("\n================ 2. Submitting Purchase Records ================");
     for (const user of users) {
-        const userIdShort = user.newAccountId.toString().split('.')[2];
-        console.log(`\n🛒 User 0.0.${userIdShort} submitting ${numSubmissionsPerUser} records...`);
+        const didShort = user.newDid.split(':').pop();
+        console.log(`\n🛒 User DID ${didShort} submitting ${numSubmissionsPerUser} records...`);
         
         for (let i = 1; i <= numSubmissionsPerUser; i++) {
             const purchaseData = {
-                user_id: user.newAccountId.toString(),
+                did_id: user.newDid, // 🚨 DID 사용
                 date: new Date().toISOString().split('T')[0],
                 item: `Product ${i}`,
                 price: 100 + i * 10,
-                order_id: `ORDER-${userIdShort}-${i}`,
+                order_id: `ORDER-${didShort}-${i}`,
                 sequence: i
             };
             await recordPurchaseWithNewAccount(client, topicId, purchaseData, user.newAccountPrivateKey);
@@ -216,16 +291,16 @@ async function simulatePurchaseRecords(client, topicId, numUsers, numSubmissions
     // 4. 기록 조회 및 출력 (Fetching)
     console.log("\n================= 3. Fetching and Verifying Records =================");
     for (const user of users) {
-        const userIdShort = user.newAccountId.toString().split('.')[2];
-        console.log(`\n--- Fetching Records for User: 0.0.${userIdShort} (ID: ${user.newAccountId.toString()}) ---`);
+        const didShort = user.newDid.split(':').pop();
+        console.log(`\n--- Fetching Records for User DID: ${didShort} (Full DID: ${user.newDid}) ---`);
         
-        // 🚨 모든 기록을 가져오는 함수 호출
-        const records = await fetchAllRecordsByAccountId(topicId, user.newAccountId);
+        // 🚨 DID를 사용하여 모든 기록을 가져오는 함수 호출
+        const records = await fetchAllRecordsByDid(topicId, user.newDid);
         
         const recordsFound = records ? records.length : 0; // 찾은 기록 수
         
         // 🚨 수정: 총 레코드 수 출력
-        console.log(`💡 Total records found for this user in topic: ${recordsFound} (Expected: ${numSubmissionsPerUser})`);
+        console.log(`💡 Total records found for this user DID in topic: ${recordsFound} (Expected: ${numSubmissionsPerUser})`);
         
         if (recordsFound > 0) {
             console.log("----------------------------------------------------------------------------------------------------");
