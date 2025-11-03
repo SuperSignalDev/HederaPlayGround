@@ -7,27 +7,95 @@ const {
     TopicCreateTransaction,
     TopicMessageSubmitTransaction,
     TopicInfoQuery,
-    TopicId // Topic ID 처리를 위해 추가
+        TopicId, // Topic ID 처리를 위해 추가
+        FileId
   } = require("@hashgraph/sdk"); // v2.64.5
 
 // Hedera DID SDK 모듈(선택적)
 // 설치되어 있지 않거나 ESM/CommonJS 불일치로 생성자를 찾을 수 없는 경우에도
 // 스크립트가 계속 동작하도록 방어적으로 처리합니다.
+// Hedera DID SDK resolver: try multiple strategies (require, dynamic import) and scan exports
 let DidMethod = null;
-let didAvailable = false;
-try {
-    const DID_SDK_MODULE = require("@hashgraph/did-sdk-js");
-    DidMethod = DID_SDK_MODULE.DidMethod 
-        || (DID_SDK_MODULE.default && DID_SDK_MODULE.default.DidMethod)
-        || (typeof DID_SDK_MODULE.default === 'function' ? DID_SDK_MODULE.default : null);
+let _didResolverCalled = false;
+async function resolveDidMethod() {
+    if (_didResolverCalled) return DidMethod;
+    _didResolverCalled = true;
 
-    if (typeof DidMethod === 'function') {
-        didAvailable = true;
-    } else {
-        console.warn("⚠️ @hashgraph/did-sdk-js loaded but DidMethod constructor not found. Continuing without DID SDK.");
+    const candidates = [];
+
+    function scanExports(moduleExports) {
+        if (!moduleExports || typeof moduleExports !== 'object' && typeof moduleExports !== 'function') return;
+        // Check common named export
+        if (moduleExports.DidMethod && typeof moduleExports.DidMethod === 'function') {
+            candidates.push(moduleExports.DidMethod);
+        }
+        // Check default export if present
+        if (moduleExports.default) {
+            const d = moduleExports.default;
+            if (typeof d === 'function') candidates.push(d);
+            if (d && typeof d === 'object' && d.DidMethod && typeof d.DidMethod === 'function') candidates.push(d.DidMethod);
+            // scan nested properties
+            for (const k of Object.keys(d)) {
+                const v = d[k];
+                if (typeof v === 'function' && /did/i.test(k)) candidates.push(v);
+            }
+        }
+        // scan top-level keys for anything that looks like a Did/Method export
+        for (const k of Object.keys(moduleExports)) {
+            try {
+                const v = moduleExports[k];
+                if (typeof v === 'function' && /did/i.test(k)) candidates.push(v);
+            } catch (_) {}
+        }
     }
-} catch (err) {
-    console.warn("⚠️ @hashgraph/did-sdk-js is not installed or could not be required. Continuing without DID SDK. (Install with 'npm install @hashgraph/did-sdk-js' to enable DID features)");
+
+    // 1) try require() (CommonJS)
+    try {
+        const mod = require("@hashgraph/did-sdk-js");
+        scanExports(mod);
+    } catch (e) {
+        // ignore, we'll try dynamic import next
+    }
+
+    // 2) try dynamic import (ESM) - useful when package is pure ESM
+    try {
+        const mod = await import("@hashgraph/did-sdk-js");
+        scanExports(mod);
+    } catch (e) {
+        // ignore
+    }
+
+    // 3) pick the first candidate whose name suggests DidMethod or Did
+    for (const c of candidates) {
+        if (typeof c === 'function') {
+            const name = c.name || '';
+            if (/DidMethod/i.test(name) || /Did/i.test(name)) {
+                DidMethod = c;
+                break;
+            }
+        }
+    }
+
+    // fallback: any function candidate
+    if (!DidMethod && candidates.length > 0) {
+        DidMethod = candidates[0];
+    }
+
+    if (!DidMethod) {
+        // produce helpful diagnostic listing possible exports
+        let diagnostic = '';
+        try {
+            const mod1 = require("@hashgraph/did-sdk-js");
+            diagnostic += 'require() exports: ' + Object.keys(mod1).join(', ') + '\n';
+        } catch (_) {}
+        try {
+            const mod2 = await import("@hashgraph/did-sdk-js");
+            diagnostic += 'import() exports: ' + Object.keys(mod2).join(', ') + '\n';
+        } catch (_) {}
+        throw new Error("Could not find DidMethod constructor in @hashgraph/did-sdk-js. Exports found: \n" + diagnostic + "\nPlease install a compatible version that exports DidMethod.");
+    }
+
+    return DidMethod;
 }
 
 // Load environment variables from .env file
@@ -72,7 +140,7 @@ function createClient(operatorIdStr, operatorKeyStr) {
 // ---------------------------
 // 2️⃣ 새 계정 생성 (Operator가 gas 대납)
 // ---------------------------
-async function createNewAccount(client) {
+async function createNewAccount(client, identityNetwork, didSdk) {
   // 새 계정 키 생성
   const newAccountPrivateKey = PrivateKey.generateECDSA();
   const newAccountPublicKey = newAccountPrivateKey.publicKey;
@@ -90,44 +158,42 @@ async function createNewAccount(client) {
   // 🚨 [수정] DID SDK를 사용하여 DID 인스턴스 생성
   // 상단에서 이미 DidMethod 생성자를 올바르게 가져왔으므로, 바로 사용합니다.
   
-  // 이전에 삽입했던 복잡한 require/생성자 검색 로직 제거
-  // const DID_SDK = require("@hashgraph/did-sdk-js");
-  // const DidMethodClass = DID_SDK.DidMethod;
-  // If DID SDK is available, use it. Otherwise, fallback to a simple DID using account id.
-  let newDid;
-  if (didAvailable && typeof DidMethod === 'function') {
-      try {
-          const didMethod = new DidMethod(newAccountId, newAccountPrivateKey);
-          newDid = didMethod.getDid(); // DID 문자열 획득
+    // 이전에는 DidMethod 타입을 유연하게 찾으려 했으나,
+    // 지금은 did-sdk-js의 HcsDid/HcsIdentityNetwork API를 직접 사용합니다.
+  
+            // ================================
+            // Hedera DID 생성 및 HCS 등록 (필수)
+            // identityNetwork and didSdk must be provided by caller (main)
+            // ================================
+            if (!identityNetwork || !didSdk) {
+                throw new Error('identityNetwork and didSdk are required to create and register Hedera DID.');
+            }
 
-          // Attempt to register DID Document on HCS; on failure log and continue
-          try {
-              const registerReceipt = await didMethod.register(client);
-              console.log("✅ DID Document Registered on HCS:", registerReceipt.toString());
-          } catch (e) {
-              console.warn("⚠️ DID registration failed (continuing):", e.message);
-          }
-      } catch (e) {
-          console.warn("⚠️ Failed to create DidMethod instance (falling back to account-based DID):", e.message);
-          newDid = `did:hedera:${newAccountId.toString()}`;
-      }
-  } else {
-      // Fallback DID when DID SDK is not available
-      newDid = `did:hedera:${newAccountId.toString()}`;
-  }
+            const { DidMethodOperation } = didSdk;
 
+            // Generate HcsDid for this account using identityNetwork helper
+            // generateDid(privateKey, withTid) -> returns HcsDid
+            const hcsDid = identityNetwork.generateDid(newAccountPrivateKey, true);
 
-  console.log("----------------------- Account Creation -----------------------");
-  console.log("🗝️ New Account Private Key:", newAccountPrivateKey.toStringDer());
-  console.log("🆔 New Account ID:", newAccountId.toString());
-  console.log("🌐 New Hedera DID:", newDid);
-  console.log("----------------------------------------------------------------");
+            // Prepare DID document JSON
+                const didDocumentJson = hcsDid.generateDidDocument().toJSON();
 
-  // 🚨 DID를 포함하여 반환
-  return { newAccountId, newAccountPrivateKey, newDid };
+            // Publish DID document to HCS (DID topic)
+            await identityNetwork.createDidTransaction(DidMethodOperation.CREATE)
+                .setDidDocument(didDocumentJson)
+                .signMessage(doc => newAccountPrivateKey.sign(doc))
+                .buildAndSignTransaction(tx => tx.setMaxTransactionFee(new Hbar(2)))
+                .execute(client);
+
+            const newDid = hcsDid.toDid ? hcsDid.toDid() : hcsDid.toString();
+    console.log("----------------------- Account Creation -----------------------");
+    console.log("🗝️ New Account Private Key:", newAccountPrivateKey.toStringDer());
+    console.log("🆔 New Account ID:", newAccountId.toString());
+    console.log("🌐 New Hedera DID:", newDid);
+    console.log("----------------------------------------------------------------");
+
+    return { newAccountId, newAccountPrivateKey, newDid };
 }
-
-// ---------------------------
 // 3️⃣ HCS Topic 생성
 // ---------------------------
 async function createTopic(client) {
@@ -250,7 +316,7 @@ async function fetchAllRecordsByDid(topicId, did) {
 // ---------------------------
 // 7️⃣ 시뮬레이션 함수 
 // ---------------------------
-async function simulatePurchaseRecords(client, topicId, numUsers, numSubmissionsPerUser) {
+async function simulatePurchaseRecords(client, topicId, numUsers, numSubmissionsPerUser, identityNetwork, didSdk) {
     const totalMessages = numUsers * numSubmissionsPerUser;
     
     console.log(`\n=================== Simulation Start (${numUsers} Users, ${numSubmissionsPerUser} Records each) ===================`);
@@ -260,7 +326,7 @@ async function simulatePurchaseRecords(client, topicId, numUsers, numSubmissions
     console.log("\n===================== 1. Creating Users =====================");
     for (let i = 0; i < numUsers; i++) {
         // 🚨 newDid를 포함하여 유저 정보 저장
-        const user = await createNewAccount(client);
+        const user = await createNewAccount(client, identityNetwork, didSdk);
         users.push(user);
     }
 
@@ -331,10 +397,53 @@ async function main() {
   const operatorKeyInstance = PrivateKey.fromStringECDSA(OPERATOR_KEY);
 
 
-  const client = createClient(operatorIdInstance, operatorKeyInstance);
+    // Ensure DidMethod is resolved before any DID-related operations
+    try {
+        await resolveDidMethod();
+    } catch (e) {
+        console.error('\n❌ DID SDK detection failed:', e.message);
+        throw e;
+    }
+
+    const client = createClient(operatorIdInstance, operatorKeyInstance);
   let topicId;
 
   try {
+    // Resolve DID/Identity network (create if missing)
+    const didSdk = require('@hashgraph/did-sdk-js');
+    const { HcsIdentityNetworkBuilder, HcsIdentityNetwork } = didSdk;
+
+    const DID_ADDRESS_BOOK_FILE_ID = process.env.DID_ADDRESS_BOOK_FILE_ID;
+    const DID_TOPIC_ID = process.env.DID_TOPIC_ID;
+    const DID_NETWORK = process.env.DID_NETWORK || 'testnet';
+
+    let identityNetwork = null;
+
+    if (DID_ADDRESS_BOOK_FILE_ID && DID_TOPIC_ID) {
+        // Load existing identity network from address book file
+        identityNetwork = await HcsIdentityNetwork.fromAddressBookFile(client, DID_NETWORK, FileId.fromString(DID_ADDRESS_BOOK_FILE_ID));
+        console.log('✅ Loaded identity network from address book file:', DID_ADDRESS_BOOK_FILE_ID);
+    } else {
+        // Create a new identity network using builder
+        console.log('🛠️  No DID address book configured — creating an identity network (address book + DID topic)...');
+        const builder = new HcsIdentityNetworkBuilder()
+            .setNetwork(DID_NETWORK)
+            .setAppnetName(`AutoIdentity-${Date.now()}`)
+            .setPublicKey(operatorKeyInstance.publicKey)
+            .setMaxTransactionFee(new Hbar(2))
+            .setDidTopicMemo(`Auto DID Topic ${Date.now()}`)
+            .setVCTopicMemo(`Auto VC Topic ${Date.now()}`);
+
+        identityNetwork = await builder.execute(client);
+        console.log('✅ Created identity network via builder.');
+    }
+
+    // Extract DID topic id for logging (if available)
+    try {
+        const didTopicId = identityNetwork.getDidTopicId ? identityNetwork.getDidTopicId() : null;
+        if (didTopicId) console.log('✅ Identity DID topic:', didTopicId.toString());
+    } catch (e) {}
+
     // 1. TOPIC ID 로드 및 생성/사용 결정
     const TOPIC_ID_ENV = process.env.TOPIC_ID;
     
@@ -364,7 +473,7 @@ async function main() {
     }
 
     // 4. 시뮬레이션 실행 (4명의 유저, 각 10개의 기록)
-    await simulatePurchaseRecords(client, topicId, 4, 10);
+    await simulatePurchaseRecords(client, topicId, 4, 10, identityNetwork, didSdk);
     
     console.log("\n✅ Process finished. Closing client.");
 
